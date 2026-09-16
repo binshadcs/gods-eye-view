@@ -18,21 +18,20 @@ disk caches may fall back to memory when the deployment filesystem is read-only.
 
 ## AIS vessels and tracks
 
-The local AIS provider maintains one upstream WebSocket and an in-memory vessel
-and track cache. Independent Vercel instances cannot share that cache and can
-compete for AISStream's one-connection-per-key limit.
+AIS uses the existing `AISSTREAM_API_KEY`, `AISSTREAM_BOUNDING_BOXES`, and
+`AISSTREAM_MESSAGE_TYPES` settings directly. No additional environment variable
+or separate backend is required. Configure the existing key in Vercel and redeploy.
 
-Run the application backend on an always-running Node host with
-`AISSTREAM_API_KEY` configured (`npm run build`, then
-`npm run preview -- --host 0.0.0.0`; put it behind HTTPS). Set
-`AIS_BACKEND_ORIGIN=https://your-backend.example` in Vercel and redeploy.
-The origin must have no path, credentials, query, or fragment. It must point to
-that backend, never the Vercel frontend. Only one backend should ingest per key.
+The Vercel handler collects AIS messages for up to eight seconds during a snapshot
+request, then closes the upstream socket before responding. Concurrent requests
+within an instance share collection, and snapshots are reused for 30 seconds.
+`/api/ais-live/track` reads the recent tracks collected by that instance.
+The local development and preview servers retain continuous ingestion.
 
-Vercel forwards `/api/ais-live` and `/api/ais-live/track` to this backend,
-including query parameters. Missing configuration returns actionable JSON with
-HTTP 503; unreachable or invalid backends return 502. A missing backend is not a
-working live feed: setting `AISSTREAM_API_KEY` on Vercel alone is insufficient.
+This is a sampled feed: messages between collection windows are missed, caches
+and tracks reset on cold starts, and separate instances do not share history.
+AISStream can reject overlapping connections from different instances using the
+same key; provider status reports failures. Missing keys return 503 rather than 404. Continuous fleet coverage and durable tracks require persistent ingestion.
 
 ## Voice and HUD summaries
 

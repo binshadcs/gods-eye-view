@@ -69,11 +69,57 @@ let _aisWebSocketImpl;
  * the Vite server keeps one backend websocket open and exposes a same-origin
  * JSON snapshot to the Cesium layer.
  */
-export function aisLiveProxy() {
+export function aisLiveProxy({
+  requestScoped = false,
+  collectionMs = 8_000,
+} = {}) {
+  let collection = null;
+  let cachedFeed = null;
+  let cachedKey = null;
+  let refreshAt = 0;
+
+  // Serverless instances may freeze immediately after a response. Collect while
+  // the request is active, and release the socket before returning. Concurrent
+  // requests on this instance share one collection and its short-lived cache.
+  async function collectSnapshot() {
+    if (collection) return collection;
+    const key = aisKeyFingerprint();
+    if (cachedFeed && cachedKey === key && Date.now() < refreshAt)
+      return cachedFeed;
+    collection = (async () => {
+      try {
+        ensureAisStreamConnection();
+        const initial = aisStreamStatusSnapshot();
+        if (
+          key &&
+          !['missing-key', 'auth-failed', 'unsupported'].includes(
+            initial.status,
+          )
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, collectionMs));
+        }
+        cachedFeed = aisStreamStatusSnapshot();
+        cachedKey = key;
+        refreshAt = Math.max(
+          Date.now() + 30_000,
+          cachedFeed.nextAttemptAt || 0,
+        );
+        return cachedFeed;
+      } finally {
+        disposeAisStream();
+      }
+    })();
+    try {
+      return await collection;
+    } finally {
+      collection = null;
+    }
+  }
+
   function install(middlewares) {
     middlewares.use('/api/ais-live', async (req, res) => {
       try {
-        ensureAisStreamConnection();
+        if (!requestScoped) ensureAisStreamConnection();
         const incoming = new URL(req.url || '', 'http://localhost');
 
         // Track sub-route MUST be handled before the rows snapshot — this
@@ -113,9 +159,10 @@ export function aisLiveProxy() {
           AISSTREAM_CACHE_MAX,
           AISSTREAM_CACHE_MAX,
         );
+        const feed = requestScoped
+          ? await collectSnapshot()
+          : aisStreamStatusSnapshot();
         const rows = aisStreamRows(maxRows);
-
-        const feed = aisStreamStatusSnapshot();
 
         res.statusCode = process.env.AISSTREAM_API_KEY ? 200 : 503;
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -156,7 +203,7 @@ export function aisLiveProxy() {
     name: 'ais-live-proxy',
     configureServer(server) {
       install(server.middlewares);
-      startAisStreamWatchdogTick();
+      if (!requestScoped) startAisStreamWatchdogTick();
       // Vite restarts the server in-process on a config change while this
       // module's state survives; without teardown each reload stacks another
       // interval and another socket.
@@ -164,7 +211,7 @@ export function aisLiveProxy() {
     },
     configurePreviewServer(server) {
       install(server.middlewares);
-      startAisStreamWatchdogTick();
+      if (!requestScoped) startAisStreamWatchdogTick();
       server.httpServer?.on('close', disposeAisStream);
     },
     // Middleware-mode backstop: there is no httpServer to hang 'close' on.

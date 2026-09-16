@@ -111,11 +111,11 @@ test('flight routes return provider JSON through the Vercel entry point', async 
 });
 
 test('excluded services now have explicit Vercel handlers', async (t) => {
-  setEnv(t, 'AIS_BACKEND_ORIGIN', '');
+  setEnv(t, 'AISSTREAM_API_KEY', '');
   setEnv(t, 'OPENAI_API_KEY', '');
   for (const [path, method, status] of [
     ['ais-live', 'GET', 503],
-    ['ais-live/track?mmsi=123456789', 'GET', 503],
+    ['ais-live/track?mmsi=bad', 'GET', 400],
     ['realtime/token', 'GET', 503],
     ['openai/hud-summary', 'GET', 405],
     ['realtime/debug-log', 'POST', 501],
@@ -125,45 +125,6 @@ test('excluded services now have explicit Vercel handlers', async (t) => {
     assert.equal(res.statusCode, status, path);
     assert.ok(JSON.parse(res.body).error);
   }
-});
-
-test('AIS forwards snapshots and tracks, preserving query and provider status', async (t) => {
-  setEnv(t, 'AIS_BACKEND_ORIGIN', 'https://ais.example.com');
-  const requests = [];
-  t.mock.method(globalThis, 'fetch', async (url, options) => {
-    requests.push(String(url));
-    assert.equal(options.redirect, 'error');
-    assert.deepEqual(options.headers, { Accept: 'application/json' });
-    return new Response(
-      JSON.stringify({ rows: [], samples: [], status: 'live' }),
-      { status: 200 },
-    );
-  });
-  for (const path of ['ais-live&maxRows=50', 'ais-live/track&mmsi=123456789']) {
-    const res = response();
-    await handler(
-      { url: `/api/index?__gev_path=${path}`, method: 'GET', headers: {} },
-      res,
-    );
-    assert.equal(res.statusCode, 200);
-    assert.equal(JSON.parse(res.body).status, 'live');
-    assert.equal(res.headers['Cache-Control'], 'no-store');
-  }
-  assert.deepEqual(requests, [
-    'https://ais.example.com/api/ais-live?maxRows=50',
-    'https://ais.example.com/api/ais-live/track?mmsi=123456789',
-  ]);
-});
-
-test('AIS upstream failures return sanitized JSON', async (t) => {
-  setEnv(t, 'AIS_BACKEND_ORIGIN', 'https://ais.example.com');
-  t.mock.method(globalThis, 'fetch', async () => {
-    throw new Error('private detail');
-  });
-  const res = response();
-  await handler({ url: '/api/ais-live', method: 'GET', headers: {} }, res);
-  assert.equal(res.statusCode, 502);
-  assert.doesNotMatch(res.body, /private detail/);
 });
 
 function setEnv(t, key, value) {
@@ -208,4 +169,93 @@ test('voice token and HUD HTTP routes reach their providers', async (t) => {
   );
   assert.equal(hud.statusCode, 200);
   assert.equal(JSON.parse(hud.body).configured, false);
+});
+
+test('AIS request collection uses existing settings, shares sockets and returns vessels and tracks', async (t) => {
+  const { WebSocketServer } = await import('ws');
+  const { aisLiveProxy } =
+    await import('../server/providers/vessels/ais-live.js');
+  const upstream = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+  await new Promise((resolve) => upstream.once('listening', resolve));
+  t.after(
+    () =>
+      new Promise((resolve) => {
+        for (const client of upstream.clients) client.terminate();
+        upstream.close(resolve);
+      }),
+  );
+  setEnv(t, 'AISSTREAM_API_KEY', 'test-ais-key');
+  setEnv(t, 'AISSTREAM_URL', `ws://127.0.0.1:${upstream.address().port}`);
+  setEnv(t, 'AISSTREAM_BOUNDING_BOXES', '[[[10,20],[11,21]]]');
+  setEnv(t, 'AISSTREAM_MESSAGE_TYPES', 'PositionReport');
+  let connections = 0;
+  let subscription;
+  upstream.on('connection', (socket) => {
+    connections++;
+    socket.on('message', (data) => {
+      subscription = JSON.parse(data.toString());
+      for (const [offset, latitude] of [
+        [-60, 10],
+        [0, 10.1],
+      ]) {
+        socket.send(
+          JSON.stringify({
+            MessageType: 'PositionReport',
+            MetaData: {
+              MMSI: 123456789,
+              latitude,
+              longitude: 20,
+              time_utc: new Date(Date.now() + offset * 1000).toISOString(),
+            },
+            Message: {
+              PositionReport: {
+                UserID: 123456789,
+                Latitude: latitude,
+                Longitude: 20,
+              },
+            },
+          }),
+        );
+      }
+    });
+  });
+  const plugin = aisLiveProxy({ requestScoped: true, collectionMs: 200 });
+  t.after(() => plugin.closeBundle());
+  const handle = createProviderHandler([plugin]);
+  const first = response();
+  const second = response();
+  await Promise.all([
+    handle({ url: '/api/ais-live?maxRows=1', method: 'GET' }, first),
+    handle({ url: '/api/ais-live?maxRows=1', method: 'GET' }, second),
+  ]);
+  assert.equal(first.statusCode, 200);
+  assert.equal(JSON.parse(first.body).status, 'live');
+  assert.equal(JSON.parse(first.body).rows.length, 1);
+  assert.equal(JSON.parse(second.body).rows.length, 1);
+  assert.equal(connections, 1);
+  assert.deepEqual(subscription, {
+    APIKey: 'test-ais-key',
+    BoundingBoxes: [
+      [
+        [10, 20],
+        [11, 21],
+      ],
+    ],
+    FilterMessageTypes: ['PositionReport'],
+  });
+  await handle({ url: '/api/ais-live', method: 'GET' }, response());
+  assert.equal(connections, 1);
+  const track = response();
+  await handle(
+    { url: '/api/ais-live/track?mmsi=123456789', method: 'GET' },
+    track,
+  );
+  assert.equal(track.statusCode, 200);
+  assert.equal(JSON.parse(track.body).samples.length, 2);
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(
+    upstream.clients.size,
+    0,
+    'socket must close before the function becomes idle',
+  );
 });

@@ -3,7 +3,7 @@ import { createProviderHandler } from '../server/vercel/handler.js';
 import { vercelServiceRoutes } from '../server/vercel/services.js';
 
 // Preview hooks expose data providers without the local .env editor.
-// AIS needs shared persistent ingestion; OpenAI's HTTP routes run here.
+// AIS uses bounded request-time collection; OpenAI HTTP routes run here.
 const excluded = new Set(['ais-live-proxy', 'openai-realtime-proxy']);
 const handle = createProviderHandler([
   ...localProviderPlugins().filter((plugin) => !excluded.has(plugin.name)),
