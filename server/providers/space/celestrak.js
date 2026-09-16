@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { promises as fsp } from 'node:fs';
 import { celestrakTleUrl } from '../../../src/data/spaceProviderRequests.js';
 
@@ -22,7 +23,10 @@ import { celestrakTleUrl } from '../../../src/data/spaceProviderRequests.js';
  */
 export function celestrakProxy() {
   const TLE_TTL_MS = 6 * 3600_000;
-  const CACHE_DIR = path.join(process.cwd(), '.gev-cache');
+  const CACHE_DIR = path.join(
+    process.env.VERCEL ? tmpdir() : process.cwd(),
+    '.gev-cache',
+  );
   const mem = new Map(); // group -> { at: epochMs, body: string }
   const inflight = new Map(); // group -> Promise<{at, body}|null>
 
