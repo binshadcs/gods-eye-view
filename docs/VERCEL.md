@@ -16,6 +16,31 @@ Provider memory caches are per function instance. Satellite disk caching uses
 temporary storage on Vercel; it is not durable across instances. Other optional
 disk caches may fall back to memory when the deployment filesystem is read-only.
 
-Live ships require continuous AIS ingestion and a shared store; this function
-does not start that persistent connection. Voice services and the local provider
-settings editor are also excluded. Their routes return JSON 404 responses.
+## AIS vessels and tracks
+
+The local AIS provider maintains one upstream WebSocket and an in-memory vessel
+and track cache. Independent Vercel instances cannot share that cache and can
+compete for AISStream's one-connection-per-key limit.
+
+Run the application backend on an always-running Node host with
+`AISSTREAM_API_KEY` configured (`npm run build`, then
+`npm run preview -- --host 0.0.0.0`; put it behind HTTPS). Set
+`AIS_BACKEND_ORIGIN=https://your-backend.example` in Vercel and redeploy.
+The origin must have no path, credentials, query, or fragment. It must point to
+that backend, never the Vercel frontend. Only one backend should ingest per key.
+
+Vercel forwards `/api/ais-live` and `/api/ais-live/track` to this backend,
+including query parameters. Missing configuration returns actionable JSON with
+HTTP 503; unreachable or invalid backends return 502. A missing backend is not a
+working live feed: setting `AISSTREAM_API_KEY` on Vercel alone is insufficient.
+
+## Voice and HUD summaries
+
+`/api/realtime/token` and `/api/openai/hud-summary` run as normal HTTP handlers.
+Set `OPENAI_API_KEY` in Vercel to enable them. The browser connects directly to
+OpenAI for the voice session. Existing optional OpenAI rate-limit settings still
+apply per instance; they are not a shared deployment-wide quota.
+
+`/api/realtime/debug-log` returns JSON with HTTP 501 because local conversation
+log files are not durable on Vercel. `/api/keys` stays unavailable: the local
+settings editor must not be exposed on a public deployment.
